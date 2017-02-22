@@ -11,6 +11,7 @@
 #include <linux/sched.h>
 #include <linux/time.h>
 #include <linux/mm.h>
+#include <linux/vmalloc.h>
 
 #include <linux/spinlock_types.h>
 #include <linux/delay.h>
