@@ -20,9 +20,10 @@
 /* Constants                                                                  */
 /******************************************************************************/
 #define MAX_CPUS                                                              64
-#define NUM_CPUS                                                              64
+#define NUM_CPUS                                                              48
 #define MAX_CLOCK_STR_LENGTH                                                  32
-#define MAX_SAMPLE_ENTRIES                                            1000000000
+/*#define MAX_SAMPLE_ENTRIES                                          1000000000*/
+#define MAX_SAMPLE_ENTRIES                                               1000000
 #define INITIAL_CPU_ARRAY                                                      \
         { -1, -1, -1, -1, -1, -1, -1, -1,                                      \
           -1, -1, -1, -1, -1, -1, -1, -1,                                      \
@@ -68,7 +69,6 @@ struct rq {
 #ifdef CONFIG_NO_HZ_FULL
         unsigned long last_sched_tick;
 #endif
-        int skip_clock_update;
         struct load_weight load;
    // ...goes on.
 };
@@ -183,7 +183,7 @@ static int my_seq_show(struct seq_file *s, void *v)
     return 0;
 }
 
-static struct seq_operations my_seq_ops = {
+static const struct seq_operations my_seq_ops = {
     .start = my_seq_start,
     .next  = my_seq_next,
     .stop  = my_seq_stop,
@@ -207,6 +207,7 @@ static void rq_stats_do_work(struct seq_file *m, unsigned long iteration)
 {
     int i;
     sample_entry_t *entry;
+    unsigned long __current_sample_entry_id;
     static unsigned int rq_size[MAX_CPUS] = INITIAL_CPU_ARRAY;
     static unsigned int last_scheduling_event[MAX_CPUS] = INITIAL_CPU_ARRAY;
     static unsigned long load[MAX_CPUS] = INITIAL_CPU_ARRAY;
@@ -219,10 +220,14 @@ static void rq_stats_do_work(struct seq_file *m, unsigned long iteration)
     set_sp_module_record_balancing_event(NULL);
     set_sp_module_record_load_change(NULL);
 
-    n_sample_entries = current_sample_entry_id < MAX_SAMPLE_ENTRIES ?
-                       current_sample_entry_id : MAX_SAMPLE_ENTRIES;
+    __current_sample_entry_id =
+        __sync_fetch_and_add(&current_sample_entry_id, 0);
+
+    n_sample_entries = __current_sample_entry_id < MAX_SAMPLE_ENTRIES ?
+                       __current_sample_entry_id : MAX_SAMPLE_ENTRIES;
 
     entry = &sample_entries[iteration];
+    if ( iteration % 10000 == 0 ) printk ("rq_stats_do_work: printing iteration %lu out of recorded %lu events. Type %d.\n", iteration, n_sample_entries -1, entry->entry_type );
 
     if (entry->entry_type == BALANCING_SAMPLE)
     {
