@@ -1,0 +1,83 @@
+Limitations: maximum number of CPUs is 64 (bitmask used to store cores considered by scheduler)
+
+uint64_t considered_cores = 0;
+for_each_cpu(i, sched_group_cpus(group)) {
+    considered_cores |= (uint64_t)1 << i;
+
+How to use the patch
+====================
+git checkout https://github.com/torvalds/linux.git
+git checkout v4.5
+git apply ../sched_profiler_ver4.5.patch
+cp ../config-4.5.0-sched_profiler_patch_maxCPU64 .config
+make oldconfig
+Check .config and double check that following is set:
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+CONFIG_LOCALVERSION="-sched_profiler_patch_maxCPU64"
+# CONFIG_MAXSMP is not set
+CONFIG_NR_CPUS=64
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Create rpm files with
+make LOCALVERSION="" -j64 -s rpm
+
+New rpm files will land here:
+cd ~/rpmbuild/RPMS/x86_64
+
+How to rebase patch to another kernel version
+=============================================
+We have patch for kernel 4.5 and we would like to port it to 4.6 version
+
+git checkout .
+git checkout v4.6
+git apply --check ../sched_profiler_ver4.5.patch
+If there are no errors go ahead and apply the patch. 
+
+Otherwise:
+1) Create new branch from v4.5 tag
+git checkout -b branch_sched_4.5 v4.5
+2) Apply patch 
+git apply ../sched_profiler_ver4.5.patch
+git status
+git add kernel/sched/core.c kernel/sched/fair.c kernel/sched/sched.h
+git commit -m "branch_sched_4.5_with_patch"
+3) Rebase to 4.6 kernel
+git rebase v4.6
+
+=> if there are no conflicts jump to step #5 (generate new patch files)
+
+4) Resolve conflicts
+CONFLICT (content): Merge conflict in kernel/sched/sched.h
+vim kernel/sched/sched.h
+search HEAD keyword                    
+
+<<<<<<< HEAD
+        rq->nr_running -= count;
+        /* Check if we still need preemption */
+        sched_update_tick_dependency(rq);
+=======
+    sp_set_nr_running(&rq->nr_running, rq->nr_running - count, cpu_of(rq));
+>>>>>>> branch_sched_4.5_with_patch
+
+Upper part - version 4.6
+Lower part - branch_sched_4.5_with_patch
+
+> FIX:
+sp_set_nr_running(&rq->nr_running, rq->nr_running - count, cpu_of(rq));
+/* Check if we still need preemption */
+sched_update_tick_dependency(rq);
+
+git add kernel/sched/sched.h
+git rebase --continue
+
+5) Generate new patch file
+git diff -M v4.6 branch_sched_4.5 > ../sched_profiler_ver4.6.patch
+
+6) Check the patch file
+git checkout .
+git checkout v4.6
+git apply --check ../sched_profiler_ver4.6.patch
+
+
+
+
