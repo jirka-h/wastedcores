@@ -1,0 +1,525 @@
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c56fb57..462443a 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2093,6 +2093,8 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
+ 	}
+ #endif /* CONFIG_SMP */
+ 
++        sp_record_scheduling_event(SP_TRY_TO_WAKE_UP, p->wake_cpu, cpu);
++
+ 	ttwu_queue(p, cpu, wake_flags);
+ stat:
+ 	ttwu_stat(p, cpu, wake_flags);
+@@ -2563,6 +2565,7 @@ void wake_up_new_task(struct task_struct *p)
+ {
+ 	struct rq_flags rf;
+ 	struct rq *rq;
++    int dst_cpu;
+ 
+ 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
+ 	p->state = TASK_RUNNING;
+@@ -2575,11 +2578,13 @@ void wake_up_new_task(struct task_struct *p)
+ 	 * Use __set_task_cpu() to avoid calling sched_class::migrate_task_rq,
+ 	 * as we're not fully set-up yet.
+ 	 */
+-	__set_task_cpu(p, select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
++	__set_task_cpu(p, dst_cpu = select_task_rq(p, task_cpu(p), SD_BALANCE_FORK, 0));
+ #endif
+ 	rq = __task_rq_lock(p, &rf);
+ 	post_init_entity_util_avg(&p->se);
+ 
++        sp_record_scheduling_event(SP_WAKE_UP_NEW_TASK, 255, dst_cpu);
++
+ 	activate_task(rq, p, 0);
+ 	p->on_rq = TASK_ON_RQ_QUEUED;
+ 	trace_sched_wakeup_new(p);
+@@ -2993,6 +2998,9 @@ void sched_exec(void)
+ 		struct migration_arg arg = { p, dest_cpu };
+ 
+ 		raw_spin_unlock_irqrestore(&p->pi_lock, flags);
++
++        sp_record_scheduling_event(SP_SCHED_EXEC, task_cpu(p), dest_cpu);
++
+ 		stop_one_cpu(task_cpu(p), migration_cpu_stop, &arg);
+ 		return;
+ 	}
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6559d19..6f3a014 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -35,6 +35,121 @@
+ 
+ #include "sched.h"
+ 
++#include <linux/module.h>
++
++/******************************************************************************/
++/* Wrappers                                                                   */
++/******************************************************************************/
++struct rq *sp_cpu_rq(int cpu) {
++    return cpu_rq(cpu);
++}
++
++EXPORT_SYMBOL(sp_cpu_rq);
++
++/******************************************************************************/
++/* Hook type definitions                                                      */
++/******************************************************************************/
++typedef void (*set_nr_running_t)(int *, int, int);
++typedef void (*record_scheduling_event_t)(int, int, int);
++typedef void (*record_scheduling_event_extra_t)(int, char, char, char, char,
++                                                     char, char, char, char);
++typedef void (*record_balancing_event_t)(int, int, uint64_t);
++typedef void (*record_load_change_t)(unsigned long, int);
++
++/******************************************************************************/
++/* Hooks                                                                      */
++/******************************************************************************/
++__read_mostly volatile set_nr_running_t sp_module_set_nr_running = NULL;
++__read_mostly volatile record_scheduling_event_t
++              sp_module_record_scheduling_event = NULL;
++__read_mostly volatile record_scheduling_event_extra_t
++              sp_module_record_scheduling_event_extra = NULL;
++__read_mostly volatile record_balancing_event_t
++              sp_module_record_balancing_event = NULL;
++__read_mostly volatile record_load_change_t
++              sp_module_record_load_change = NULL;
++
++/******************************************************************************/
++/* Default hook implementations                                               */
++/******************************************************************************/
++void sp_set_nr_running(int *nr_running_p, int new_nr_running, int dst_cpu)
++{
++    if (sp_module_set_nr_running)
++        (*sp_module_set_nr_running)(nr_running_p, new_nr_running, dst_cpu);
++    else
++        *nr_running_p = new_nr_running;
++}
++
++void sp_record_scheduling_event(int event_type, int src_cpu, int dst_cpu)
++{
++    if (sp_module_record_scheduling_event)
++        (*sp_module_record_scheduling_event)(event_type, src_cpu, dst_cpu);
++}
++
++void sp_record_scheduling_event_extra(int event_type,
++                char data1, char data2, char data3, char data4,
++                char data5, char data6, char data7, char data8)
++{
++    if (sp_module_record_scheduling_event_extra)
++        (*sp_module_record_scheduling_event_extra)(event_type,
++            data1, data2, data3, data4, data5, data6, data7, data8);
++}
++
++void sp_record_balancing_event(int event_type, int cpu, uint64_t data)
++{
++    if (sp_module_record_balancing_event)
++        (*sp_module_record_balancing_event)(event_type, cpu, data);
++}
++
++void sp_record_load_change(unsigned long load, int cpu)
++{
++    if (sp_module_record_load_change)
++        (*sp_module_record_load_change)(load, cpu);
++}
++
++/******************************************************************************/
++/* Hook setters                                                               */
++/******************************************************************************/
++void set_sp_module_set_nr_running(set_nr_running_t __sp_module_set_nr_running)
++{
++    sp_module_set_nr_running = __sp_module_set_nr_running;
++
++}
++
++void set_sp_module_record_scheduling_event
++    (record_scheduling_event_t __sp_module_record_scheduling_event)
++{
++    sp_module_record_scheduling_event = __sp_module_record_scheduling_event;
++}
++
++void set_sp_module_record_scheduling_event_extra
++    (record_scheduling_event_extra_t __sp_module_record_scheduling_event_extra)
++{
++    sp_module_record_scheduling_event_extra =
++        __sp_module_record_scheduling_event_extra;
++}
++
++void set_sp_module_record_balancing_event
++    (record_balancing_event_t __sp_module_record_balancing_event)
++{
++    sp_module_record_balancing_event = __sp_module_record_balancing_event;
++}
++
++void set_sp_module_record_load_change
++    (record_load_change_t __sp_module_record_load_change)
++{
++    sp_module_record_load_change = __sp_module_record_load_change;
++}
++
++/******************************************************************************/
++/* Symbols                                                                    */
++/******************************************************************************/
++EXPORT_SYMBOL(set_sp_module_set_nr_running);
++EXPORT_SYMBOL(set_sp_module_record_scheduling_event);
++EXPORT_SYMBOL(set_sp_module_record_scheduling_event_extra);
++EXPORT_SYMBOL(set_sp_module_record_balancing_event);
++EXPORT_SYMBOL(set_sp_module_record_load_change);
++
+ /*
+  * Targeted preemption latency for CPU-bound tasks:
+  *
+@@ -2607,7 +2722,10 @@ static inline void account_numa_dequeue(struct rq *rq, struct task_struct *p)
+ {
+ 	update_load_add(&cfs_rq->load, se->load.weight);
+ 	if (!parent_entity(se))
++    {
+ 		update_load_add(&rq_of(cfs_rq)->load, se->load.weight);
++        sp_record_load_change(rq_of(cfs_rq)->load.weight, rq_of(cfs_rq)->cpu);
++    }
+ #ifdef CONFIG_SMP
+ 	if (entity_is_task(se)) {
+ 		struct rq *rq = rq_of(cfs_rq);
+@@ -2624,7 +2742,10 @@ static inline void account_numa_dequeue(struct rq *rq, struct task_struct *p)
+ {
+ 	update_load_sub(&cfs_rq->load, se->load.weight);
+ 	if (!parent_entity(se))
++        {
+ 		update_load_sub(&rq_of(cfs_rq)->load, se->load.weight);
++                sp_record_load_change(rq_of(cfs_rq)->load.weight, rq_of(cfs_rq)->cpu);
++        }
+ #ifdef CONFIG_SMP
+ 	if (entity_is_task(se)) {
+ 		account_numa_dequeue(rq_of(cfs_rq), task_of(se));
+@@ -5412,6 +5533,7 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 	int imbalance_scale = 100 + (sd->imbalance_pct-100)/2;
+ 	unsigned long imbalance = scale_load_down(NICE_0_LOAD) *
+ 				(sd->imbalance_pct-100) / 100;
++        uint64_t considered_cores = 0;
+ 
+ 	if (sd_flag & SD_BALANCE_WAKE)
+ 		load_idx = sd->wake_idx;
+@@ -5439,6 +5561,8 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 		max_spare_cap = 0;
+ 
+ 		for_each_cpu(i, sched_group_cpus(group)) {
++            considered_cores |= (uint64_t)1 << i;
++
+ 			/* Bias balancing toward cpus of our domain */
+ 			if (local_group)
+ 				load = source_load(i, load_idx);
+@@ -5491,6 +5615,8 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 		}
+ 	} while (group = group->next, group != sd->groups);
+ 
++        sp_record_balancing_event(SP_CONSIDERED_CORES_FIG, this_cpu,
++                                   considered_cores);
+ 	/*
+ 	 * The cross-over point between using spare capacity or least load
+ 	 * is too conservative for high utilization tasks on partially
+@@ -5538,6 +5664,7 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 	int least_loaded_cpu = this_cpu;
+ 	int shallowest_idle_cpu = -1;
+ 	int i;
++    uint64_t considered_cores = 0;
+ 
+ 	/* Check if we have any choice: */
+ 	if (group->group_weight == 1)
+@@ -5545,6 +5672,8 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 
+ 	/* Traverse only the allowed CPUs */
+ 	for_each_cpu_and(i, sched_group_cpus(group), tsk_cpus_allowed(p)) {
++        considered_cores |= (uint64_t)1 << i;
++
+ 		if (idle_cpu(i)) {
+ 			struct rq *rq = cpu_rq(i);
+ 			struct cpuidle_state *idle = idle_get_state(rq);
+@@ -5576,6 +5705,9 @@ static unsigned long capacity_spare_wake(int cpu, struct task_struct *p)
+ 		}
+ 	}
+ 
++    sp_record_balancing_event(SP_CONSIDERED_CORES_FIC, this_cpu,
++                               considered_cores);
++
+ 	return shallowest_idle_cpu != -1 ? shallowest_idle_cpu : least_loaded_cpu;
+ }
+ 
+@@ -5788,34 +5920,73 @@ static int select_idle_cpu(struct task_struct *p, struct sched_domain *sd, int t
+  */
+ static int select_idle_sibling(struct task_struct *p, int prev, int target)
+ {
+-	struct sched_domain *sd;
+-	int i;
++    struct sched_domain *sd;
++    int i;
++    uint64_t considered_cores = 0;
++    considered_cores |= (uint64_t)1 << target;
+ 
+-	if (idle_cpu(target))
+-		return target;
++    if (idle_cpu(target))
++    {
++        if (prev > 0)
++            sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++                                       considered_cores);
++	return target;
++    }
++
++    considered_cores |= (uint64_t)1 << prev;
+ 
+ 	/*
+ 	 * If the previous cpu is cache affine and idle, don't be stupid.
+ 	 */
+ 	if (prev != target && cpus_share_cache(prev, target) && idle_cpu(prev))
++        {
++        if (prev > 0)
++            sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++                                       considered_cores);
+ 		return prev;
++        }
+ 
+ 	sd = rcu_dereference(per_cpu(sd_llc, target));
+ 	if (!sd)
++        {
++		if (prev > 0)
++		    sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++					       considered_cores);
+ 		return target;
++        }
+ 
+ 	i = select_idle_core(p, sd, target);
+-	if ((unsigned)i < nr_cpumask_bits)
++        considered_cores |= (uint64_t)1 << i;
++	if ((unsigned)i < nr_cpumask_bits) {
++		if (prev > 0)
++		    sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++					       considered_cores);
+ 		return i;
++        }
+ 
+ 	i = select_idle_cpu(p, sd, target);
++        considered_cores |= (uint64_t)1 << i;
+ 	if ((unsigned)i < nr_cpumask_bits)
++        {
++		if (prev > 0)
++		    sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++					       considered_cores);
+ 		return i;
++        }
+ 
+ 	i = select_idle_smt(p, sd, target);
++        considered_cores |= (uint64_t)1 << i;
+ 	if ((unsigned)i < nr_cpumask_bits)
++        {
++		if (prev > 0)
++		    sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++					       considered_cores);
+ 		return i;
++        }
+ 
++        if (prev > 0)
++            sp_record_balancing_event(SP_CONSIDERED_CORES_SIS, prev,
++                                       considered_cores);
+ 	return target;
+ }
+ 
+@@ -6735,13 +6906,19 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
+ /*
+  * detach_task() -- detach the task for the migration specified in env
+  */
+-static void detach_task(struct task_struct *p, struct lb_env *env)
++static void detach_task(struct task_struct *p, struct lb_env *env,
++                        int event_type)
+ {
+ 	lockdep_assert_held(&env->src_rq->lock);
+ 
+ 	p->on_rq = TASK_ON_RQ_MIGRATING;
+ 	deactivate_task(env->src_rq, p, 0);
+ 	set_task_cpu(p, env->dst_cpu);
++    if (event_type >= 0)
++        /* Otherwise we're coming from active_load_balance_cpu_stop and the
++           event was registered already. */
++        sp_record_scheduling_event(event_type, cpu_of(env->src_rq),
++                                    env->dst_cpu);
+ }
+ 
+ /*
+@@ -6760,7 +6937,7 @@ static struct task_struct *detach_one_task(struct lb_env *env)
+ 		if (!can_migrate_task(p, env))
+ 			continue;
+ 
+-		detach_task(p, env);
++        detach_task(p, env, -1);
+ 
+ 		/*
+ 		 * Right now, this is only the second place where
+@@ -6782,7 +6959,7 @@ static struct task_struct *detach_one_task(struct lb_env *env)
+  *
+  * Returns number of detached tasks if successful and 0 otherwise.
+  */
+-static int detach_tasks(struct lb_env *env)
++static int detach_tasks(struct lb_env *env, int event_type)
+ {
+ 	struct list_head *tasks = &env->src_rq->cfs_tasks;
+ 	struct task_struct *p;
+@@ -6827,7 +7004,7 @@ static int detach_tasks(struct lb_env *env)
+ 		if ((load / 2) > env->imbalance)
+ 			goto next;
+ 
+-		detach_task(p, env);
++        detach_task(p, env, event_type);
+ 		list_add(&p->se.group_node, &env->tasks);
+ 
+ 		detached++;
+@@ -7343,12 +7520,15 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ {
+ 	unsigned long load;
+ 	int i, nr_running;
++        uint64_t considered_cores = 0;
+ 
+ 	memset(sgs, 0, sizeof(*sgs));
+ 
+ 	for_each_cpu_and(i, sched_group_cpus(group), env->cpus) {
+ 		struct rq *rq = cpu_rq(i);
+ 
++        considered_cores |= (uint64_t)1 << i;
++
+ 		/* Bias balancing toward cpus of our domain */
+ 		if (local_group)
+ 			load = target_load(i, load_idx);
+@@ -7375,6 +7555,9 @@ static inline void update_sg_lb_stats(struct lb_env *env,
+ 			sgs->idle_cpus++;
+ 	}
+ 
++    sp_record_balancing_event(SP_CONSIDERED_CORES_USLS, env->dst_cpu,
++                               considered_cores);
++
+ 	/* Adjust by relative CPU capacity of the group */
+ 	sgs->group_capacity = group->sgc->capacity;
+ 	sgs->avg_load = (sgs->group_load*SCHED_CAPACITY_SCALE) / sgs->group_capacity;
+@@ -7863,11 +8046,14 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 	struct rq *busiest = NULL, *rq;
+ 	unsigned long busiest_load = 0, busiest_capacity = 1;
+ 	int i;
++    uint64_t considered_cores = 0;
+ 
+ 	for_each_cpu_and(i, sched_group_cpus(group), env->cpus) {
+ 		unsigned long capacity, wl;
+ 		enum fbq_type rt;
+ 
++        considered_cores |= (uint64_t)1 << i;
++
+ 		rq = cpu_rq(i);
+ 		rt = fbq_classify_rq(rq);
+ 
+@@ -7924,6 +8110,9 @@ static struct rq *find_busiest_queue(struct lb_env *env,
+ 		}
+ 	}
+ 
++    sp_record_balancing_event(SP_CONSIDERED_CORES_FBQ, env->dst_cpu,
++                              considered_cores);
++
+ 	return busiest;
+ }
+ 
+@@ -8007,7 +8196,7 @@ static int should_we_balance(struct lb_env *env)
+  */
+ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			struct sched_domain *sd, enum cpu_idle_type idle,
+-			int *continue_balancing)
++            int *continue_balancing, int event_type)
+ {
+ 	int ld_moved, cur_ld_moved, active_balance = 0;
+ 	struct sched_domain *sd_parent = sd->parent;
+@@ -8082,7 +8271,7 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		 * cur_ld_moved - load moved in current iteration
+ 		 * ld_moved     - cumulative load moved across iterations
+ 		 */
+-		cur_ld_moved = detach_tasks(&env);
++        cur_ld_moved = detach_tasks(&env, event_type + SP_MOVE_TASKS);
+ 
+ 		/*
+ 		 * We've detached some tasks from busiest_rq. Every
+@@ -8204,6 +8393,9 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 			raw_spin_unlock_irqrestore(&busiest->lock, flags);
+ 
+ 			if (active_balance) {
++                sp_record_scheduling_event
++                    (event_type + SP_ACTIVE_LOAD_BALANCE_CPU_STOP,
++                     cpu_of(busiest), this_cpu);
+ 				stop_one_cpu_nowait(cpu_of(busiest),
+ 					active_load_balance_cpu_stop, busiest,
+ 					&busiest->active_balance_work);
+@@ -8343,7 +8535,7 @@ static int idle_balance(struct rq *this_rq)
+ 
+ 			pulled_task = load_balance(this_cpu, this_rq,
+ 						   sd, CPU_NEWLY_IDLE,
+-						   &continue_balancing);
++                           &continue_balancing, SP_IDLE_BALANCE);
+ 
+ 			domain_cost = sched_clock_cpu(this_cpu) - t0;
+ 			if (domain_cost > sd->max_newidle_lb_cost)
+@@ -8665,7 +8857,8 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
+ 		}
+ 
+ 		if (time_after_eq(jiffies, sd->last_balance + interval)) {
+-			if (load_balance(cpu, rq, sd, idle, &continue_balancing)) {
++            if (load_balance(cpu, rq, sd, idle, &continue_balancing,
++                             SP_REBALANCE_DOMAINS)) {
+ 				/*
+ 				 * The LBF_DST_PINNED logic could have changed
+ 				 * env->dst_cpu, so we can't know our idle
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 7b34c78..f46598e 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -22,6 +22,30 @@
+ #define SCHED_WARN_ON(x)	((void)(x))
+ #endif
+ 
++extern void sp_set_nr_running(int *nr_running_p, int nr_running, int dst_cpu);
++extern void sp_record_scheduling_event(int event_type, int src_cpu,
++                                        int dst_cpu);
++extern void sp_record_scheduling_event_extra(int event_type,
++                char data1, char data2, char data3, char data4,
++                char data5, char data6, char data7, char data8);
++extern void sp_record_load_change(unsigned long load, int cpu);
++
++enum {
++    SP_SCHED_EXEC = 0,
++    SP_TRY_TO_WAKE_UP,
++    SP_WAKE_UP_NEW_TASK,
++    SP_IDLE_BALANCE,
++    SP_REBALANCE_DOMAINS,
++    SP_MOVE_TASKS = 10,
++    SP_ACTIVE_LOAD_BALANCE_CPU_STOP = 20,
++    SP_CONSIDERED_CORES_SIS = 200,
++    SP_CONSIDERED_CORES_USLS,
++    SP_CONSIDERED_CORES_FBQ,
++    SP_CONSIDERED_CORES_FIG,
++    SP_CONSIDERED_CORES_FIC
++};
++
++
+ struct rq;
+ struct cpuidle_state;
+ 
+@@ -1400,7 +1424,7 @@ static inline void add_nr_running(struct rq *rq, unsigned count)
+ {
+ 	unsigned prev_nr = rq->nr_running;
+ 
+-	rq->nr_running = prev_nr + count;
++    sp_set_nr_running(&rq->nr_running, prev_nr + count, cpu_of(rq));
+ 
+ 	if (prev_nr < 2 && rq->nr_running >= 2) {
+ #ifdef CONFIG_SMP
+@@ -1414,7 +1438,7 @@ static inline void add_nr_running(struct rq *rq, unsigned count)
+ 
+ static inline void sub_nr_running(struct rq *rq, unsigned count)
+ {
+-	rq->nr_running -= count;
++        sp_set_nr_running(&rq->nr_running, rq->nr_running - count, cpu_of(rq));
+ 	/* Check if we still need preemption */
+ 	sched_update_tick_dependency(rq);
+ }
