@@ -1,0 +1,410 @@
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ad3ec9e..844858f 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -930,6 +930,11 @@ struct sched_info {
+ 	/* timestamps */
+ 	unsigned long long last_arrival,/* when we last ran on a cpu */
+ 			   last_queued;	/* when we were last queued to run */
++
++   /* Invariants */
++   unsigned long delayedload;
++   unsigned long delayedload_count;
++   unsigned long olddelay, newdelay;
+ };
+ #endif /* CONFIG_SCHED_INFO */
+ 
+@@ -3230,6 +3235,26 @@ static inline unsigned long *end_of_stack(struct task_struct *p)
+ 
+ #endif
+ 
++#define NR_SCHED_DOMAINS 5
++struct sched_report {
++   int cpu;
++   long unsigned rdt;
++   char sched_domain_name[64];
++   long unsigned bug_report_size;
++   long unsigned bug_report_max_size;
++   char *bug_report;
++};
++void generate_bug_report(int cpu);
++struct sched_report** get_reports(void); // return [NR_CPUS][NR_SCHED_DOMAINS] bug reports
++
++void set_invariant_debug(int val); //1 = debug mode, 0 = no debug
++
++#define MIN_NON_TRANSCIENT_FAILURES 10
++typedef enum buggy_states { NOT_BUGGY, MAYBE_BUGGY, RESET_BUGGINESS, BUGGY = MIN_NON_TRANSCIENT_FAILURES } buggy_state_t;
++void check_idle_overloaded(buggy_state_t *buggy_cpus); //Invariant 1
++void check_deficit(buggy_state_t *buggy_cpus); // Invariant 2
++void check_useless_migrations(buggy_state_t *buggy_cpus); // Invariant 3
++
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ static inline void *try_get_task_stack(struct task_struct *tsk)
+ {
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 6559d19..c1048c3 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -36,6 +36,21 @@
+ #include "sched.h"
+ 
+ /*
++* Invariant variables
++*/
++
++#define ONE_SECOND (1000000000LL)
++
++static int _generate_bug_report = 0;
++static int debug_invariants = 0;
++static int monitor_migrations[NR_CPUS];
++static int buggy_migrations[NR_CPUS];
++static int successul_steals[NR_CPUS];
++static struct sched_report **sched_reports;
++void fill_bug_report(int cpu, struct sched_domain *sd);
++
++
++/*
+  * Targeted preemption latency for CPU-bound tasks:
+  *
+  * NOTE: this latency value is not the same as the concept of
+@@ -716,7 +731,7 @@ static u64 sched_vslice(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 
+ #ifdef CONFIG_SMP
+ static int select_idle_sibling(struct task_struct *p, int prev_cpu, int cpu);
+-static unsigned long task_h_load(struct task_struct *p);
++unsigned long task_h_load(struct task_struct *p);
+ 
+ /*
+  * We choose a half-life close to 1 scheduling period.
+@@ -6739,6 +6754,25 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
+ {
+ 	lockdep_assert_held(&env->src_rq->lock);
+ 
++   //Invariant: no useless/wrong migration
++   if(monitor_migrations[cpu_of(env->src_rq)]) {
++      unsigned long src_load	  = source_load(cpu_of(env->src_rq), 0);
++      unsigned long dst_load = target_load(env->dst_cpu, 0);
++      if(src_load <= dst_load) {
++         buggy_migrations[cpu_of(env->src_rq)] = 1;
++         if(debug_invariants)
++            printk("Useless migration from cpu %d to %d (load %ld or %ld vs %ld or %ld)\n",
++                  (int)cpu_of(env->src_rq), (int)env->dst_cpu,
++                  (long)source_load(cpu_of(env->src_rq), 0),
++                  (long)target_load(cpu_of(env->src_rq), 0),
++                  (long)source_load(env->dst_cpu, 0),
++                  (long)target_load(env->dst_cpu, 0));
++      }
++      monitor_migrations[cpu_of(env->src_rq)] = 0;
++   }
++   //Invariant - Remember that the dest cpu has stolen a task since last iteration
++   successul_steals[env->dst_cpu] = 1;
++
+ 	p->on_rq = TASK_ON_RQ_MIGRATING;
+ 	deactivate_task(env->src_rq, p, 0);
+ 	set_task_cpu(p, env->dst_cpu);
+@@ -6977,7 +7011,7 @@ static void update_cfs_rq_h_load(struct cfs_rq *cfs_rq)
+ 	}
+ }
+ 
+-static unsigned long task_h_load(struct task_struct *p)
++unsigned long task_h_load(struct task_struct *p)
+ {
+ 	struct cfs_rq *cfs_rq = task_cfs_rq(p);
+ 
+@@ -6998,7 +7032,7 @@ static inline void update_blocked_averages(int cpu)
+ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ }
+ 
+-static unsigned long task_h_load(struct task_struct *p)
++unsigned long task_h_load(struct task_struct *p)
+ {
+ 	return p->se.avg.load_avg;
+ }
+@@ -8028,6 +8062,9 @@ static int load_balance(int this_cpu, struct rq *this_rq,
+ 		.tasks		= LIST_HEAD_INIT(env.tasks),
+ 	};
+ 
++   if(_generate_bug_report)
++      fill_bug_report(this_cpu, sd);
++
+ 	/*
+ 	 * For NEWLY_IDLE load_balancing, we don't need to consider
+ 	 * other cpus in our group
+@@ -9483,3 +9520,249 @@ __init void init_sched_fair_class(void)
+ #endif /* SMP */
+ 
+ }
++
++
++/*
++* Invariant code!
++*/
++
++void set_invariant_debug(int val) {
++   debug_invariants = val;
++}
++EXPORT_SYMBOL(set_invariant_debug);
++
++/*
++ * Invariant 1: no idle CPU while another CPU is overloaded
++ *          && the idle CPU can steal from the overloaded CPU
++ */
++void check_idle_overloaded(buggy_state_t *buggy_cpus) {
++   int cpu,
++       cpu1,
++       cpu2,
++       nb_overload = 0,
++       nb_idle = 0,
++       overload_cpus[NR_CPUS],
++       idle_cpus[NR_CPUS],
++       nb_buggy = 0;
++
++   memset(overload_cpus, 0, sizeof(overload_cpus));
++   memset(idle_cpus, 0, sizeof(idle_cpus));
++
++   // Get the overloaded and idle cpus
++   for_each_online_cpu(cpu) {
++      if (cpu_rq(cpu)->nr_running >= 2) {
++         nb_overload++;
++         overload_cpus[cpu] = 1;
++      } else if(cpu_rq(cpu)->nr_running == 0) {
++         nb_idle++;
++         idle_cpus[cpu] = 1;
++      }
++   }
++
++   // Everything looks good
++   if(!nb_overload || !nb_idle)
++      goto end;
++
++   // Check that load can be better balanced, cpu1 = overload, cpu2 = idle
++   // We have to check that because of tasksets
++   for_each_online_cpu(cpu1) {
++      if(!overload_cpus[cpu1])
++         continue;
++      for_each_online_cpu(cpu2) {
++         struct task_struct *p, *n;
++         if(!idle_cpus[cpu2])
++            continue;
++         list_for_each_entry_safe(p, n, &cpu_rq(cpu1)->cfs_tasks, se.group_node) {
++            if (cpumask_test_cpu(cpu2, tsk_cpus_allowed(p))) {
++               if(buggy_cpus[cpu2] == NOT_BUGGY)
++                  nb_buggy++;
++               // cpu2 could has stolen a task from cpu1
++               if(successul_steals[cpu2]) // cpu2 has stolen a task during the last iteration, reset bug counter
++                  buggy_cpus[cpu2] = RESET_BUGGINESS;
++               else
++                  buggy_cpus[cpu2] = MAYBE_BUGGY; // cpu2 has not stolen, continue to increase the bug counter
++               break;
++            }
++         }
++      }
++   }
++
++end:
++   if(debug_invariants && nb_buggy) {
++      printk("Found %d buggy CPUS that are idle and could steal\n", nb_buggy);
++   }
++   memset(successul_steals, 0, sizeof(successul_steals));
++}
++EXPORT_SYMBOL(check_idle_overloaded);
++
++/*
++ * Invariant 2: Check that all threads have a similar "deficit" in runtime.
++ * This is actually tricky because not all threads are launched at the same time and
++ * the context of execution changes (more or less competing threads). So we actually
++ * only consider delays that occured during the last X seconds and threads that were
++ * active during that time.
++ * We discard tasksetted threads because they might have higher delays due to scheduling
++ * constraints.
++ * We have to take into account the "load" of tasks in order for the computation to work,
++ * because tasks with a high "load" are granted more CPU time.
++ * Delays are computed in stats.h:sched_info_arrive.
++ */
++/* The minimum delay that we think is buggy if the function is called once per second (10% delay) */
++#define MIN_BUGGY_DELAY 200000000LU
++
++static int is_valid_delayed_thread(struct task_struct *p, unsigned long tick_time) {
++   if(p->flags & PF_KTHREAD)
++      return false; // We don't want to consider kernel threads
++   if(p->nr_cpus_allowed != nr_cpu_ids)
++      return false; // The task is tasksetted, computations get extra complex so ignore it
++   if(p->se.avg.load_avg < 950)
++      return false; // we are only interrested in high CPU usage tasks (950 - 1024) because other tasks are likely to not be delayed
++   if(tick_time && p->sched_info.olddelay == tick_time && p->sched_info.delayedload_count)
++      return true;
++   return false;
++}
++
++void check_deficit(buggy_state_t *buggy_cpus) {
++   static unsigned long tick_time;
++   struct task_struct *g, *p;
++   struct timespec now;
++   unsigned long total_delay = 0, nb_threads = 0;
++   unsigned long average_delay = 0;
++   int nb_buggy_threads = 0;
++   unsigned long now64;
++   unsigned long min_delay;
++
++   ktime_get_ts(&now);
++   now64 = now.tv_sec*ONE_SECOND + now.tv_nsec;
++
++   /* Find the delay of all "significant" task (not tasksetted, high cpu usage) */
++   rcu_read_lock();
++   do_each_thread(g, p) {
++      if(is_valid_delayed_thread(p, tick_time)) {
++         //total_delay += p->sched_info.delayedload / p->sched_info.delayedload_count;
++         total_delay += p->sched_info.delayedload;
++         nb_threads++;
++         if(debug_invariants)
++            printk("Thread %s avgdelay %ld/%ld = %ld vruntime %ld %ld %ld load %ld %ld %ld\n", p->comm, (long)p->sched_info.delayedload, (long)p->sched_info.delayedload_count, (long)(p->sched_info.delayedload / p->sched_info.delayedload_count), (long)p->se.sum_exec_runtime, (long)p->se.vruntime, (long)p->se.prev_sum_exec_runtime, (long)task_h_load(p), (long)p->se.load.weight, (long)p->se.avg.load_avg);
++      }
++   } while_each_thread(g, p);
++
++   if(nb_threads)
++      average_delay = total_delay / nb_threads;
++   min_delay = 10000LU * (now64 - tick_time) / ONE_SECOND * MIN_BUGGY_DELAY / 10000LU;
++   if(debug_invariants)
++      printk("Average delay %ld - min_delay %ld (MIN_BUGGY_DELAY %ld)\n", (long)average_delay, (long)min_delay, (long)MIN_BUGGY_DELAY);
++
++   do_each_thread(g, p) {
++      if(is_valid_delayed_thread(p, tick_time)) {
++         //unsigned long thread_delay = p->sched_info.delayedload / p->sched_info.delayedload_count;
++         unsigned long thread_delay = p->sched_info.delayedload;
++         if((average_delay < min_delay && thread_delay * 100LU > min_delay * 110LU) // low average, but thread has a significant delay => bug?
++               // or high average delay, and thread is not in the +/- 10% of the average delay
++           || (average_delay >= min_delay && (thread_delay * 100LU < 90LU * average_delay || thread_delay * 100LU > 110LU * average_delay))) {
++            if(!task_cfs_rq(p))
++               continue;
++            buggy_cpus[cpu_of(rq_of(task_cfs_rq(p)))] = BUGGY;
++            nb_buggy_threads++;
++            if(debug_invariants)
++               printk("Buggy thread found %s - delay %ld / %ld\n", p->comm, (long)thread_delay, (long)average_delay);
++         }
++      }
++      p->sched_info.newdelay = now64; //warning: thread is no longer "valid" after that
++   } while_each_thread(g, p);
++   rcu_read_unlock();
++
++   tick_time = now64;
++}
++EXPORT_SYMBOL(check_deficit);
++
++/*
++ * Invariant 3: No wrong/useless migration.
++ * The actual code that does the check is in move_task.
++ * The idea is that at each round, we reset "monitor_migrations" so that the next migration
++ * on each cpu is checked for correctness.
++ */
++void check_useless_migrations(buggy_state_t *buggy_cpus) {
++   int cpu;
++   for_each_online_cpu(cpu) {
++      if(buggy_migrations[cpu])
++         buggy_cpus[cpu] = BUGGY;
++   }
++   memset(buggy_migrations, 0, sizeof(*buggy_migrations));
++   memset(monitor_migrations, 1, sizeof(*monitor_migrations));
++}
++EXPORT_SYMBOL(check_useless_migrations);
++
++
++/*
++ * Bug report generator.
++ */
++void generate_bug_report(int buggy_cpu) {
++   int cpu, sd;
++   sched_reports = kzalloc(NR_CPUS * sizeof(*sched_reports), GFP_KERNEL);
++   for_each_online_cpu(cpu) {
++      sched_reports[cpu] = kzalloc(NR_SCHED_DOMAINS * sizeof(*sched_reports[cpu]), GFP_KERNEL);
++      for(sd = 0; sd < NR_SCHED_DOMAINS; sd++) {
++         sched_reports[cpu][sd].bug_report_size = 0;
++         sched_reports[cpu][sd].bug_report_max_size = 128 * 1024;
++         sched_reports[cpu][sd].bug_report = kzalloc(sched_reports[cpu][sd].bug_report_max_size, GFP_KERNEL);
++      }
++   }
++   _generate_bug_report = 1;
++}
++EXPORT_SYMBOL(generate_bug_report);
++
++struct sched_report** get_reports(void) {
++   return sched_reports;
++}
++EXPORT_SYMBOL(get_reports);
++
++void fill_bug_report(int lb_cpu, struct sched_domain *sd) {
++   int cpu;
++   struct sched_report *r = &sched_reports[lb_cpu][sd->level];
++
++   if(r->rdt)
++      return;
++
++   r->cpu = lb_cpu;
++   r->rdt = sched_clock();
++   strcpy(r->sched_domain_name, sd->name);
++
++   for_each_online_cpu(cpu) {
++      struct sched_domain *sd;
++      struct task_struct *p, *n;
++		struct rq *rq = cpu_rq(cpu);
++      struct sched_group *group;
++
++      r->bug_report_size += sprintf(r->bug_report + r->bug_report_size,
++            "#Runqueue of CPU %d - source_load %lu target_load %lu\n",
++            cpu,
++            source_load(cpu, 0),
++            target_load(cpu, 0));
++
++      list_for_each_entry_safe(p, n, &rq->cfs_tasks, se.group_node) {
++         r->bug_report_size += sprintf(r->bug_report + r->bug_report_size,
++               "#\tThread %s - avg_load %ld - final load %ld (weight %ld)\n",
++               p->comm,
++               (long)p->se.avg.load_avg,
++               (long)task_h_load(p),
++               (long)p->se.load.weight);
++      }
++
++      r->bug_report_size += sprintf(r->bug_report + r->bug_report_size,
++            "#Scheduling domains of CPU %d\n",
++            cpu);
++      for_each_domain(cpu, sd) {
++         int i;
++         r->bug_report_size += sprintf(r->bug_report + r->bug_report_size, "#\tSched domain %s:\n", sd->name);
++         group = sd->groups;
++         do {
++            r->bug_report_size += sprintf(r->bug_report + r->bug_report_size, "#\t\t");
++            for_each_cpu(i, sched_group_cpus(group)) {
++               r->bug_report_size += sprintf(r->bug_report + r->bug_report_size, "%d\t", i);
++            }
++            r->bug_report_size += sprintf(r->bug_report + r->bug_report_size, "\n");
++         } while (group = group->next, group != sd->groups);
++      }
++   }
++}
+diff --git a/kernel/sched/stats.h b/kernel/sched/stats.h
+index 34659a8..4765948 100644
+--- a/kernel/sched/stats.h
++++ b/kernel/sched/stats.h
+@@ -84,6 +84,7 @@ static inline void sched_info_dequeued(struct rq *rq, struct task_struct *t)
+  * long it was waiting to run.  We also note when it began so that we
+  * can keep stats on how long its timeslice is.
+  */
++unsigned long task_h_load(struct task_struct *p);
+ static void sched_info_arrive(struct rq *rq, struct task_struct *t)
+ {
+ 	unsigned long long now = rq_clock(rq), delta = 0;
+@@ -96,6 +97,15 @@ static void sched_info_arrive(struct rq *rq, struct task_struct *t)
+ 	t->sched_info.pcount++;
+ 
+ 	rq_sched_info_arrive(rq, delta);
++
++   // Invariants
++   if(t->sched_info.newdelay != t->sched_info.olddelay) {
++      t->sched_info.delayedload = 0;
++      t->sched_info.delayedload_count = 0;
++      t->sched_info.olddelay = t->sched_info.newdelay;
++   }
++   t->sched_info.delayedload += task_h_load(t) * delta;
++   t->sched_info.delayedload_count++;
+ }
+ 
+ /*
