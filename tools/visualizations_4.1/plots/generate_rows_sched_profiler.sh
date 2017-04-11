@@ -1,7 +1,37 @@
 #!/bin/bash
+shopt -s extglob
 
 COMPILER=hhvm
-INPUT=/tmpfs/group-imbalance.txt
+#INPUT=/tmpfs/group-imbalance.txt
+
+usage()
+{
+  echo "usage: `basename $0` FILE"
+  echo "       FILE was created by running cat /proc/sched_profiler"
+  echo "       with sched_profiler.ko kernel module loaded"
+  echo "       FILE can be compressed with xz"
+}
+
+if [ "$#" -ne 1 ]
+then
+  usage
+  exit 1
+fi
+
+INPUT="$1"
+
+if [[ ! -r "${INPUT}" ]] || [[ ! -f "${INPUT}" ]] ; then
+  echo "\"${INPUT}\" is not readable"
+  usage
+  exit 1
+fi
+
+FILETYPE=$(file -b "${INPUT}")
+case $FILETYPE in 
+XZ*)     BIN="xzcat";; 
+*ASCII*) BIN= "cat";; 
+*)       echo "Unknown filetype ${FILETYPE}"; usage; exit1;;
+esac
 
 generate_sched_profiler_graphs_all_parallel()
 {
@@ -11,13 +41,13 @@ generate_sched_profiler_graphs_all_parallel()
     FILE_BASENAME=$(basename $INPUT)
     FILE_ROOT=${FILE_BASENAME%.*}
 
-    cat $INPUT |                                                               \
+    ${BIN} $INPUT |                                                               \
         ${COMPILER}                                                            \
         ./parse_rows_sched_profiler.php                                        \
         output/${5}_standard.png                                               \
         $3 60500 -1 0 standard $1 $2 $4 &
 
-    cat $INPUT |                                                               \
+    ${BIN} $INPUT |                                                               \
         ${COMPILER}                                                            \
         ./parse_rows_sched_profiler.php                                        \
         output/${5}_load.png                                                   \
